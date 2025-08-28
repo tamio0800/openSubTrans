@@ -1,7 +1,7 @@
 import streamlit as st
-import os
 from srt_processor import parse_srt_file, create_srt_output, validate_srt_content
 from translator import translate_with_openai, estimate_translation_cost
+from context_manager import ContextManager
 
 # Page configuration
 st.set_page_config(
@@ -38,12 +38,29 @@ with st.sidebar:
         index=0,
         help="Choose the GPT-5 model for translation."
     )
+    
+    st.divider()
+    
+    # Context Memory settings
+    st.subheader("🧠 Context Memory")
+    use_context_memory = st.checkbox(
+        "Enable terminology consistency",
+        value=True,
+        help="Automatically remember and maintain consistent translations of names, places, and other proper nouns across the subtitle file"
+    )
+    
+    if use_context_memory:
+        st.caption("📚 This feature will help maintain consistent translations of character names, places, and other proper nouns throughout your subtitle file.")
+    else:
+        st.caption("⚠️ Without context memory, proper nouns may be translated inconsistently.")
 
 # Initialize session state
 if 'file_processed' not in st.session_state:
     st.session_state.file_processed = False
 if 'translation_completed' not in st.session_state:
     st.session_state.translation_completed = False
+if 'context_manager' not in st.session_state:
+    st.session_state.context_manager = None
 
 # File upload
 st.subheader("📁 Upload Subtitle File")
@@ -131,17 +148,32 @@ if translate_button and can_translate:
     st.session_state.translation_completed = False
     
     try:
-        # Translation process with simple progress
+        # Translation process with real-time progress
         with st.spinner("Translating..."):
             progress_bar = st.progress(0)
             
-            # Perform translation
+            # Define progress update function
+            def update_progress(progress):
+                progress_bar.progress(int(progress * 100))
+            
+            # Initialize context manager if enabled
+            context_manager = None
+            if use_context_memory:
+                context_manager = ContextManager()
+            
+            # Perform translation with progress updates
             translated_texts = translate_with_openai(
                 st.session_state.texts_to_translate, 
                 target_language, 
                 api_key, 
-                selected_model
+                selected_model,
+                progress_callback=update_progress,
+                context_manager=context_manager
             )
+            
+            # Store context manager for potential future use
+            if context_manager:
+                st.session_state.context_manager = context_manager
             
             progress_bar.progress(100)
             
@@ -180,6 +212,25 @@ if st.session_state.translation_completed:
         type="primary",
         use_container_width=True
     )
+    
+    # Show context memory summary if available
+    if st.session_state.context_manager:
+        context_summary = st.session_state.context_manager.get_context_summary()
+        if context_summary['total_terms'] > 0:
+            with st.expander("🧠 Context Memory Summary"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Terms learned", context_summary['total_terms'])
+                with col2:
+                    st.metric("High confidence", context_summary['high_confidence_terms'])
+                
+                if context_summary['established_terms']:
+                    st.subheader("📚 Established Terms")
+                    for original, translation in list(context_summary['established_terms'].items())[:5]:
+                        st.write(f"• **{original}** → {translation}")
+                    
+                    if len(context_summary['established_terms']) > 5:
+                        st.caption(f"... and {len(context_summary['established_terms']) - 5} more terms")
     
     # Show sample results
     with st.expander("Preview translation", expanded=True):

@@ -29,11 +29,11 @@ def test_real_translation():
     
     # Load sample subtitle file
     try:
-        with open('tests/sample_subtitle.srt', 'r', encoding='utf-8') as f:
+        with open('sample_subtitle.srt', 'r', encoding='utf-8') as f:
             srt_content = f.read()
         print("✅ Sample subtitle file loaded")
     except FileNotFoundError:
-        print("❌ Sample subtitle file not found at tests/sample_subtitle.srt")
+        print("❌ Sample subtitle file not found at sample_subtitle.srt")
         return False
     
     # Validate and parse SRT

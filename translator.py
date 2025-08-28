@@ -4,19 +4,26 @@ OpenAI translation module for subtitle translation using GPT-5
 
 import openai
 import time
-from typing import List, Dict, Optional, Tuple
 import logging
+from typing import List, Dict, Optional, Tuple
+from prompts import SubtitlePrompts
+from context_manager import ContextManager
 
 
-def translate_with_openai(text_list: List[str], target_language: str, api_key: str, model: str = "gpt-5-mini") -> List[str]:
+def translate_with_openai(text_list: List[str], target_language: str, api_key: str, model: str = "gpt-5-mini", progress_callback=None, context_manager: ContextManager = None) -> List[str]:
     """
-    Translate a list of texts using GPT-5 Responses API
+    Translate a list of texts using smart batch processing for better consistency
+    
+    This function automatically groups texts into batches of ~12 for improved dialogue
+    coherence and efficiency, while maintaining proper nouns consistency.
     
     Args:
         text_list (List[str]): List of text strings to translate
         target_language (str): Target language for translation
         api_key (str): OpenAI API key
         model (str): GPT-5 model to use (default: gpt-5-mini)
+        progress_callback (callable, optional): Function to call with progress updates (0.0 to 1.0)
+        context_manager (ContextManager, optional): Context manager for terminology consistency
         
     Returns:
         List[str]: List of translated texts in the same order as input
@@ -61,23 +68,57 @@ def translate_with_openai(text_list: List[str], target_language: str, api_key: s
         # Initialize OpenAI client
         client = openai.OpenAI(api_key=api_key)
         
-        # Individual translation for fastest results
+        # Smart batch translation for better consistency and efficiency
         all_translations = []
+        batch_size = 12  # Optimal batch size for dialogue coherence
         
-        for i, text in enumerate(non_empty_texts):
+        # Get established terms for context-aware translation
+        established_terms = {}
+        if context_manager:
+            established_terms = context_manager.get_established_terms()
+        
+        # Process texts in batches
+        for i in range(0, len(non_empty_texts), batch_size):
+            batch_texts = non_empty_texts[i:i + batch_size]
+            
             try:
-                # Create individual translation request
-                translated_text = _translate_single(client, text, target_language, model)
-                all_translations.append(translated_text)
+                # Translate the batch with context awareness
+                batch_translations = _translate_batch(client, batch_texts, target_language, model, established_terms)
+                all_translations.extend(batch_translations)
                 
-                # Very small delay to avoid overwhelming the API
-                if i < len(non_empty_texts) - 1:
-                    time.sleep(0.05)
+                # Update context manager with new translations if available
+                if context_manager and batch_translations:
+                    new_terms = context_manager.extract_terms_from_translation_pair(batch_texts, batch_translations)
+                    if new_terms:
+                        context_manager.update_terms(new_terms)
+                        # Update established terms for next batch
+                        established_terms.update(new_terms)
+                
+                # Update progress
+                if progress_callback:
+                    progress = min(1.0, (i + batch_size) / len(non_empty_texts))
+                    progress_callback(progress)
+                
+                # Brief pause between batches to respect API limits
+                if i + batch_size < len(non_empty_texts):
+                    time.sleep(0.2)
                     
             except Exception as e:
-                logging.error(f"Failed to translate text '{text}': {str(e)}")
-                # Use original text if translation fails
-                all_translations.append(text)
+                logging.error(f"Batch translation failed for batch starting at {i}: {str(e)}")
+                # Fallback to individual translation for this batch
+                for j, text in enumerate(batch_texts):
+                    try:
+                        translated_text = _translate_single(client, text, target_language, model)
+                        all_translations.append(translated_text)
+                    except Exception as single_e:
+                        logging.error(f"Failed to translate text '{text}': {str(single_e)}")
+                        all_translations.append(text)  # Use original text if all fails
+                    
+                    # Update progress even in fallback mode
+                    if progress_callback:
+                        current_completed = i + j + 1
+                        progress = min(1.0, current_completed / len(non_empty_texts))
+                        progress_callback(progress)
         
         # Reconstruct the full result list
         result = [""] * len(text_list)
@@ -112,17 +153,22 @@ def _translate_single(client: openai.OpenAI, text: str, target_language: str, mo
     """
     
     try:
+        # Get prompts from centralized prompt manager
+        prompts = SubtitlePrompts.get_single_translation_prompt(target_language)
+        system_prompt = prompts["system"]
+        user_prompt = prompts["user_template"].format(target_language=target_language, text=text)
+        
         # Use Chat Completions API with GPT-5 compatible parameters
         api_params = {
             "model": model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a professional subtitle translator. Return only the translation, nothing else."
+                    "content": system_prompt
                 },
                 {
                     "role": "user", 
-                    "content": f"Translate this subtitle to {target_language}: {text}"
+                    "content": user_prompt
                 }
             ]
             # GPT-5 models use default parameters only
@@ -140,6 +186,153 @@ def _translate_single(client: openai.OpenAI, text: str, target_language: str, mo
     except Exception as e:
         logging.error(f"Single translation failed: {str(e)}")
         return text  # Return original if translation fails
+
+
+def _translate_batch(client: openai.OpenAI, texts: List[str], target_language: str, model: str, established_terms: Dict[str, str] = None) -> List[str]:
+    """
+    Translate multiple texts in a single batch for better consistency
+    
+    Args:
+        client: OpenAI client instance
+        texts: List of texts to translate
+        target_language: Target language
+        model: GPT-5 model to use
+        established_terms: Dictionary of previously established term translations
+        
+    Returns:
+        List of translated texts in the same order as input
+    """
+    
+    try:
+        # Create numbered batch for clear parsing
+        numbered_texts = []
+        for i, text in enumerate(texts, 1):
+            numbered_texts.append(f"{i}. {text}")
+        
+        batch_content = "\n".join(numbered_texts)
+        
+        # Get prompts from centralized prompt manager (context-aware if terms available)
+        if established_terms:
+            prompts = SubtitlePrompts.get_context_aware_batch_prompt(target_language, established_terms)
+        else:
+            prompts = SubtitlePrompts.get_batch_translation_prompt(target_language)
+        
+        system_prompt = prompts["system"]
+        user_prompt = prompts["user_template"].format(target_language=target_language, batch_content=batch_content)
+        
+        # Make batch API call
+        api_params = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user", 
+                    "content": user_prompt
+                }
+            ]
+        }
+        
+        response = client.chat.completions.create(**api_params)
+        translated_content = response.choices[0].message.content.strip()
+        
+        # Parse the numbered response
+        translations = _parse_batch_response(translated_content, len(texts))
+        
+        return translations
+        
+    except Exception as e:
+        logging.error(f"Batch translation failed: {str(e)}")
+        raise e
+
+
+def _parse_batch_response(response_text: str, expected_count: int) -> List[str]:
+    """
+    Parse batch response from the API - handles both numbered and simple formats
+    
+    Args:
+        response_text: The response from the API
+        expected_count: Number of translations expected
+        
+    Returns:
+        List of parsed translations
+    """
+    
+    response_text = response_text.strip()
+    
+    # Handle single translation case (for backward compatibility with tests)
+    if expected_count == 1:
+        # If it's just a single response without numbering, return it as-is
+        lines = response_text.split('\n')
+        if len(lines) == 1 or not any(line.strip().startswith(('1.', '1)')) for line in lines):
+            return [response_text]
+    
+    # Handle numbered batch format
+    lines = response_text.split('\n')
+    translations = []
+    
+    for i in range(1, expected_count + 1):
+        found = False
+        for line in lines:
+            line = line.strip()
+            # Look for numbered format like "1. translation" or "1) translation"
+            if line.startswith(f"{i}.") or line.startswith(f"{i})"):
+                # Extract the translation part after the number and separator
+                if '.' in line:
+                    translation = line.split('.', 1)[1].strip()
+                else:
+                    translation = line.split(')', 1)[1].strip()
+                translations.append(translation)
+                found = True
+                break
+        
+        if not found:
+            # If numbered format not found, try line-by-line approach
+            if i <= len(lines):
+                line = lines[i-1].strip()
+                # Remove any leading numbers if present
+                if line.startswith(f"{i}.") or line.startswith(f"{i})"):
+                    if '.' in line:
+                        translation = line.split('.', 1)[1].strip()
+                    else:
+                        translation = line.split(')', 1)[1].strip()
+                    translations.append(translation)
+                else:
+                    translations.append(line)
+                found = True
+        
+        if not found:
+            translations.append(f"Translation {i} not found")
+    
+    # Ensure we have the right number of translations
+    while len(translations) < expected_count:
+        translations.append(f"Missing translation {len(translations) + 1}")
+    
+    return translations[:expected_count]
+
+
+def translate_with_context_memory(text_list: List[str], target_language: str, api_key: str, model: str = "gpt-5-mini", progress_callback=None) -> Tuple[List[str], ContextManager]:
+    """
+    Convenience function for translation with automatic context memory management
+    
+    Args:
+        text_list: List of texts to translate
+        target_language: Target language for translation
+        api_key: OpenAI API key
+        model: GPT-5 model to use
+        progress_callback: Optional progress callback function
+        
+    Returns:
+        Tuple of (translated_texts, context_manager)
+    """
+    context_manager = ContextManager()
+    translated_texts = translate_with_openai(
+        text_list, target_language, api_key, model, 
+        progress_callback, context_manager
+    )
+    return translated_texts, context_manager
 
 
 def estimate_translation_cost(text_list: List[str], target_language: str, model: str = "gpt-5-mini") -> Dict[str, any]:
