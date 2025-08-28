@@ -1,0 +1,22 @@
+1
+00:00:01,000 --> 00:00:03,500
+Welcome to our movie subtitle translator!
+
+2
+00:00:04,000 --> 00:00:07,200
+This application can translate subtitles
+from English to many different languages.
+
+3
+00:00:08,000 --> 00:00:11,000
+Simply upload your SRT file, enter your OpenAI API key,
+and select your target language.
+
+4
+00:00:12,000 --> 00:00:14,500
+The translation will preserve
+the original timing and formatting.
+
+5
+00:00:15,000 --> 00:00:17,800
+Ready to try it out? Let's get started!
